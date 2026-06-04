@@ -53,7 +53,133 @@ HEADERS = {
     ],
 }
 
-DIRECTION_MAP = [
+import sqlite3
+
+# iron-sentinel 数据库路径
+DB_PATH = os.path.expanduser("~/.qclaw/skills/iron-sentinel/data/stock_data.db")
+
+def load_direction_map():
+    """从 iron-sentinel 数据库动态加载板块分类映射
+    
+    返回: dict {stock_name: direction_label}
+    """
+    if not os.path.exists(DB_PATH):
+        print(f"[WARN] 数据库不存在: {DB_PATH}，回退到静态 DIRECTION_MAP")
+        return _build_static_map()
+    
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # 查询概念板块 + 行业分类，建立 name -> 板块 映射
+        # 优先级：概念板块 > 三级行业 > 二级行业
+        cursor.execute("""
+            SELECT s.stock_name, 
+                   GROUP_CONCAT(DISTINCT cb.board_name) as concepts,
+                   GROUP_CONCAT(DISTINCT i3.name) as industry_l3,
+                   GROUP_CONCAT(DISTINCT i2.name) as industry_l2
+            FROM stocks s
+            LEFT JOIN stock_concept sc ON s.stock_code = sc.stock_code
+            LEFT JOIN concept_boards cb ON sc.board_code = cb.board_code
+            LEFT JOIN stock_industry si ON s.stock_code = si.stock_code AND si.level = 'L3'
+            LEFT JOIN industry_l3 i3 ON si.industry_code = i3.code
+            LEFT JOIN stock_industry si2 ON s.stock_code = si2.stock_code AND si2.level = 'L2'
+            LEFT JOIN industry_l2 i2 ON si2.industry_code = i2.code
+            WHERE s.listing_status = 'Normal'
+            GROUP BY s.stock_code
+        """)
+        
+        direction_map = {}
+        for row in cursor.fetchall():
+            name, concepts, industry_l3, industry_l2 = row
+            direction = _classify_stock(name, concepts or "", industry_l3 or "", industry_l2 or "")
+            if direction:
+                direction_map[name] = direction
+        
+        conn.close()
+        print(f"[INFO] 动态加载完成，共 {len(direction_map)} 只个股有分类")
+        return direction_map
+        
+    except Exception as e:
+        print(f"[WARN] 数据库查询失败: {e}，回退到静态 DIRECTION_MAP")
+        return _build_static_map()
+
+
+def _classify_stock(name, concepts, industry_l3, industry_l2):
+    """根据概念和行业分类个股方向"""
+    c = (concepts + "," + industry_l3 + "," + industry_l2).lower()
+    
+    # 存储芯片
+    if any(k in c for k in ['存储芯片', '存储器', 'nand', 'nor', 'dram']):
+        return "存储芯片"
+    # 光模块/CPO
+    if any(k in c for k in ['光模块', 'cpo', '共封装光学', '光通信']):
+        return "光模块/CPO"
+    # 光纤光缆
+    if any(k in c for k in ['光纤', '光缆', '光通信']):
+        return "光纤光缆"
+    # AI服务器/算力
+    if any(k in c for k in ['ai服务器', '算力', '服务器', 'ai芯片', 'gpu', '寒武纪', '海光']):
+        return "AI服务器/算力"
+    # PCB
+    if any(k in c for k in ['pcb', '印制电路板', '电路板']):
+        return "PCB"
+    # 先进封装
+    if any(k in c for k in ['先进封装', '封装测试', 'chiplet', '扇出型封装']):
+        return "先进封装"
+    # 半导体设备
+    if any(k in c for k in ['半导体设备', '刻蚀', '薄膜沉积', '光刻', '清洗设备']):
+        return "半导体设备"
+    # 半导体材料
+    if any(k in c for k in ['半导体材料', '硅片', '光刻胶', '电子特气', '靶材']):
+        return "半导体材料"
+    # 芯片设计
+    if any(k in c for k in ['芯片设计', '集成电路设计', '模拟芯片', '数字芯片', 'soc']):
+        return "芯片设计"
+    # 面板/显示
+    if any(k in c for k in ['面板', '显示器件', 'oled', 'lcd', 'led']):
+        return "面板/显示"
+    # 锂电池
+    if any(k in c for k in ['锂电池', '动力电池', '固态电池', '磷酸铁锂']):
+        return "锂电池"
+    # 光伏
+    if any(k in c for k in ['光伏', '太阳能电池', '逆变器', '组件', '硅片']):
+        return "光伏"
+    # 新能源（广义，包含风电、储能等）
+    if any(k in c for k in ['新能源', '储能', '风电', '氢能源']):
+        return "新能源"
+    # 通信设备
+    if any(k in c for k in ['通信设备', '通信终端', '基站', '5g']):
+        return "通信设备"
+    # 消费电子
+    if any(k in c for k in ['消费电子', '智能手机', '可穿戴', '耳机', '音箱']):
+        return "消费电子"
+    # 计算机设备
+    if any(k in c for k in ['计算机设备', '服务器硬件', '工作站']):
+        return "计算机设备"
+    # 软件/IT服务
+    if any(k in c for k in ['软件开发', 'it服务', 'saas', '云计算服务']):
+        return "软件/IT服务"
+    
+    # 静态兜底：检查是否在 DIRECTION_MAP 中
+    for direction, names in STATIC_DIRECTION_MAP:
+        if name in names:
+            return direction
+    
+    return None
+
+
+def _build_static_map():
+    """从静态 DIRECTION_MAP 构建 name -> direction 字典"""
+    m = {}
+    for direction, names in STATIC_DIRECTION_MAP:
+        for n in names:
+            m[n] = direction
+    return m
+
+
+# 静态 DIRECTION_MAP 作为兜底
+STATIC_DIRECTION_MAP = [
     ("存储芯片", ["兆易创新","佰维存储","江波龙","德明利","朗科科技","普冉股份","东芯股份","恒烁股份","聚辰股份"]),
     ("光模块/CPO", ["中际旭创","新易盛","天孚通信","光迅科技","剑桥科技","华工科技","博创科技","太辰光","德科立","联特科技"]),
     ("光纤光缆", ["亨通光电","长飞光纤","中天科技","通光线缆","永鼎股份","特发信息","汇源通信"]),
@@ -72,6 +198,34 @@ DIRECTION_MAP = [
     ("计算机设备", ["浪潮信息","中科曙光","中国长城","同方股份","广电运通","新大陆","证通电子"]),
     ("软件/IT服务", ["金山办公","科大讯飞","恒生电子","宝信软件","用友网络","广联达","深信服","奇安信"]),
 ]
+
+# 全局缓存，首次加载
+direction_map_cache = None
+
+def get_direction_map():
+    """获取方向映射（带缓存）"""
+    global direction_map_cache
+    if direction_map_cache is None:
+        direction_map_cache = load_direction_map()
+    return direction_map_cache
+
+
+def get_direction(name):
+    """获取个股方向分类"""
+    return get_direction_map().get(name)
+
+
+# 删除旧的 DIRECTION_MAP 引用，改为使用 get_direction()
+# DIRECTION_MAP = ... (已删除)
+
+
+def classify_direction(name):
+    """根据个股名称动态查询板块分类"""
+    return get_direction(name) or ""
+
+
+# 删除旧的 DIRECTION_MAP 引用，改为使用 get_direction()
+# DIRECTION_MAP = ... (已删除)
 
 
 def load_token():
@@ -198,7 +352,7 @@ def init_or_write_top(data, header_row, today_str, token):
         data_rows.append([
             today_str, i + 1, s["code"], s["name"],
             f"{s['change_pct']:+.2f}", s["amount_yi"],
-            f"{s['pct_of_market']}%", classify_direction(s["name"]),
+            f"{s['pct_of_market']}%", get_direction(s["name"]) or "",
         ])
 
     if not has_header:
@@ -233,10 +387,8 @@ def init_or_write_top(data, header_row, today_str, token):
 # ── 数据构建 ───────────────────────────────────────────
 
 def classify_direction(name):
-    for d, names in DIRECTION_MAP:
-        if any(n in name for n in names):
-            return d
-    return "其他"
+    """根据个股名称动态查询板块分类"""
+    return get_direction(name) or "其他"
 
 
 def main_direction(top10):
