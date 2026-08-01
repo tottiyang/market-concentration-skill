@@ -371,31 +371,57 @@ def read_a1(sheet_id, token):
     return False, ""
 
 
+def read_column_a(sheet_id, token, max_rows=500):
+    """一次性读取整列 A，返回 [(row_num, value)] 列表"""
+    url = (f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+           f"{SPREADSHEET_TOKEN}/values/{sheet_id}!A1:A{max_rows}")
+    r = feishu_get(url, token)
+    vals = r.get("data", {}).get("valueRange", {}).get("values", [])
+    rows = []
+    for i, v in enumerate(vals):
+        val = str(v[0]).strip() if v and v[0] else ""
+        rows.append((i + 1, val))
+    return rows
+
+
 def find_date_row(sheet_id, today_str, token, max_rows=500):
-    for row in range(1, max_rows):
-        url = (f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
-               f"{SPREADSHEET_TOKEN}/values/{sheet_id}!A{row}:A{row}")
-        r = feishu_get(url, token)
-        vals = r.get("data", {}).get("valueRange", {}).get("values")
-        if not vals or not vals[0] or not (vals[0][0] or "").strip():
-            return None
-        if str(vals[0][0]).strip() == today_str:
-            return row
+    """在列 A 中查找指定日期，返回第一个匹配的行号，找不到返回 None"""
+    col_a = read_column_a(sheet_id, token, max_rows)
+    for row_num, val in col_a:
+        if val == today_str:
+            return row_num
     return None
 
 
 def find_last_data_row(sheet_id, token, max_rows=500):
-    """找到最后一个有数据的行号（1-based），空表返回 0"""
+    """找到最后一个连续有数据的行号（1-based），空表返回 0"""
+    col_a = read_column_a(sheet_id, token, max_rows)
     last = 0
-    for row in range(1, max_rows):
-        url = (f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
-               f"{SPREADSHEET_TOKEN}/values/{sheet_id}!A{row}:A{row}")
-        r = feishu_get(url, token)
-        vals = r.get("data", {}).get("valueRange", {}).get("values")
-        if not vals or not vals[0] or not (vals[0][0] or "").strip():
+    for row_num, val in col_a:
+        if val:
+            last = row_num
+        else:
             return last
-        last = row
     return last
+
+
+def verify_write(sheet_id, data_rows, start_row, today_str, token, label):
+    """写入后校验：读出已写行，确认日期和条数正确"""
+    n = len(data_rows)
+    end_row = start_row + n - 1
+    url = (f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+           f"{SPREADSHEET_TOKEN}/values/{sheet_id}!A{start_row}:A{end_row}")
+    r = feishu_get(url, token)
+    vals = r.get("data", {}).get("valueRange", {}).get("values", [])
+    written = [str(v[0]).strip() for v in vals if v and v[0]]
+    date_matches = sum(1 for w in written if w == today_str)
+    ok = date_matches == n
+    if not ok:
+        print(f"  ⚠️ {label}: 校验失败，期望 {n} 行 date={today_str}，实际 {len(written)} 行中 {date_matches} 行匹配")
+        print(f"    写入范围: R{start_row}-R{end_row}")
+    else:
+        print(f"  ✅ {label}: 校验通过 ({n} 行写入确认)")
+    return ok
 
 
 # ── 快照 / 流动性: 表头+数据 ──────────────────────────
@@ -418,7 +444,7 @@ def init_or_write_row(sheet_id, header_row, data_row, today_str, token, label):
             print(f"  ❌ {label}: 数据失败 code={code} msg={msg}")
             return False
         print(f"  ✅ {label}: 首次写入 (R1=表头 R2=数据)")
-        return True
+        return verify_write(sheet_id, [data_row], 2, today_str, token, label)
 
     # 已有表头：查重/追加
     existing = find_date_row(sheet_id, today_str, token)
@@ -426,17 +452,19 @@ def init_or_write_row(sheet_id, header_row, data_row, today_str, token, label):
         ok, code, msg = put_row(sheet_id, existing, data_row, token)
         if ok:
             print(f"  ✅ {label}: 覆盖 行{existing}")
+            return verify_write(sheet_id, [data_row], existing, today_str, token, label)
         else:
             print(f"  ❌ {label}: 覆盖失败 code={code} msg={msg}")
-        return ok
+            return False
     else:
         next_row = find_last_data_row(sheet_id, token) + 1
         ok, code, msg = put_row(sheet_id, next_row, data_row, token)
         if ok:
             print(f"  ✅ {label}: 追加 行{next_row}")
+            return verify_write(sheet_id, [data_row], next_row, today_str, token, label)
         else:
             print(f"  ❌ {label}: 追加失败 code={code} msg={msg}")
-        return ok
+            return False
 
 
 # ── 头部明细: 表头 + 多行数据 ──────────────────────────
@@ -480,7 +508,7 @@ def init_or_write_top(data, header_row, today_str, token):
         time.sleep(0.3)
 
     print(f"  ✅ 头部明细: {mode} 10行 (从行{start})")
-    return True
+    return verify_write(sid, data_rows, start, today_str, token, "头部明细")
 
 
 # ── 数据构建 ───────────────────────────────────────────
@@ -550,23 +578,38 @@ def main():
     data = analyze()
     today_str = date.today().strftime("%m-%d")
 
+    # 数据完整性校验：总量低于1万亿时报警不写入
+    if data["total_amount_yi"] < 10000:
+        print(f"⚠️  数据异常：总量 {data['total_amount_yi']}亿 低于正常阈值1万亿，跳过写入！")
+        print(f"   阈值建议：检查行情API是否返回完整数据（当前仅 {data['total_stocks']} 只股票）")
+        sys.exit(1)
+
     print(f"📊 成交集中度 → 飞书表格")
     print(f"   日期: {today_str}  总量: {data['total_amount_yi']}亿  "
           f"前300占比: {data['tiers']['300']['pct_of_market']}%")
     print()
 
+    results = {}
+
     snapshot_row = build_snapshot_row(data, today_str)
-    init_or_write_row(SHEETS["snapshot"], HEADERS["snapshot"], snapshot_row,
+    results["snapshot"] = init_or_write_row(SHEETS["snapshot"], HEADERS["snapshot"], snapshot_row,
                       today_str, token, "每日快照")
 
-    init_or_write_top(data, HEADERS["top"], today_str, token)
+    results["top"] = init_or_write_top(data, HEADERS["top"], today_str, token)
 
     liquidity_row = build_liquidity_row(data, today_str)
-    init_or_write_row(SHEETS["liquidity"], HEADERS["liquidity"], liquidity_row,
+    results["liquidity"] = init_or_write_row(SHEETS["liquidity"], HEADERS["liquidity"], liquidity_row,
                       today_str, token, "流动性趋势")
 
-    print(f"\n✅ 全部完成!")
+    all_ok = all(results.values())
+    print(f"\n{'✅ 全部完成!' if all_ok else '❌ 部分写入失败'}")
+    for k, v in results.items():
+        status = "✅" if v else "❌"
+        print(f"  {status} {k}")
     print(f"https://my.feishu.cn/sheets/{SPREADSHEET_TOKEN}")
+    
+    if not all_ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
