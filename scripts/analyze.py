@@ -3,11 +3,30 @@
 
 import akshare as ak
 import pandas as pd
-import json, sys
+import json, sys, time
+
+# 安静 tqdm 输出
+import io, contextlib
+_silence = io.StringIO()
+
+
+def _fetch_with_retry(max_retry=6, base_sleep=15):
+    """多次重试，绕开新浪接口限流"""
+    last_err = None
+    for i in range(max_retry):
+        try:
+            with contextlib.redirect_stdout(_silence):
+                df = ak.stock_zh_a_spot()
+            if df is not None and len(df) > 100:
+                return df
+        except Exception as e:
+            last_err = e
+        time.sleep(base_sleep + i * 10)
+    raise RuntimeError(f"akshare 接口重试{max_retry}次仍失败: {last_err}")
 
 
 def analyze():
-    df = ak.stock_zh_a_spot()
+    df = _fetch_with_retry()
     df = df[df['成交额'].notna()]
     df['成交额'] = pd.to_numeric(df['成交额'], errors='coerce')
     df = df[df['成交额'] > 0].copy()

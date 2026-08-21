@@ -571,11 +571,25 @@ def build_liquidity_row(data, today_str):
 
 def main():
     sys.path.insert(0, os.path.join(SKILL_DIR, "scripts"))
-    from analyze import analyze
 
     load_config()  # 加载飞书配置
     token = load_token()
-    data = analyze()
+    # 优先使用缓存数据（绕开 akshare 接口限流）
+    cache_path = os.path.join(SKILL_DIR, "scripts", ".last_data.json")
+    if "--force-analyze" not in sys.argv and os.path.exists(cache_path):
+        # 仅当缓存是当天时使用
+        cache_mtime = os.path.getmtime(cache_path)
+        cache_date = date.fromtimestamp(cache_mtime)
+        if cache_date == date.today():
+            with open(cache_path) as f:
+                data = json.load(f)
+            print(f"📂 使用缓存数据 ({cache_path}, {cache_mtime})")
+        else:
+            from analyze import analyze
+            data = analyze()
+    else:
+        from analyze import analyze
+        data = analyze()
     today_str = date.today().strftime("%m-%d")
 
     # 数据完整性校验：总量低于1万亿时报警不写入
