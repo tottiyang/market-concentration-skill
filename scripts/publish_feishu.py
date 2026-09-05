@@ -371,7 +371,7 @@ def read_a1(sheet_id, token):
     return False, ""
 
 
-def read_column_a(sheet_id, token, max_rows=500):
+def read_column_a(sheet_id, token, max_rows=3000):
     """一次性读取整列 A，返回 [(row_num, value)] 列表"""
     url = (f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
            f"{SPREADSHEET_TOKEN}/values/{sheet_id}!A1:A{max_rows}")
@@ -384,7 +384,7 @@ def read_column_a(sheet_id, token, max_rows=500):
     return rows
 
 
-def find_date_row(sheet_id, today_str, token, max_rows=500):
+def find_date_row(sheet_id, today_str, token, max_rows=3000):
     """在列 A 中查找指定日期，返回第一个匹配的行号，找不到返回 None"""
     col_a = read_column_a(sheet_id, token, max_rows)
     for row_num, val in col_a:
@@ -393,16 +393,32 @@ def find_date_row(sheet_id, today_str, token, max_rows=500):
     return None
 
 
-def find_last_data_row(sheet_id, token, max_rows=500):
-    """找到最后一个连续有数据的行号（1-based），空表返回 0"""
+def find_last_data_row(sheet_id, token, max_rows=3000):
+    """找到全局最后一个有数据的行号（1-based），跳过中间空洞；空表返回 0"""
     col_a = read_column_a(sheet_id, token, max_rows)
     last = 0
     for row_num, val in col_a:
         if val:
             last = row_num
-        else:
-            return last
     return last
+
+
+def check_block_boundary(sheet_id, start_row, n_rows, today_str, token):
+    """写入前检查目标块内是否含其他日期的旧数据；若发现额外日期则报错。
+    返回 (ok, conflict_dates)：ok=True 表示安全可写，False 表示块内有冲突。"""
+    end_row = start_row + n_rows - 1
+    url = (f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+           f"{SPREADSHEET_TOKEN}/values/{sheet_id}!A{start_row}:A{end_row}")
+    r = feishu_get(url, token)
+    vals = r.get("data", {}).get("valueRange", {}).get("values", [])
+    existing_dates = set()
+    for v in vals:
+        if v and v[0]:
+            d = str(v[0]).strip()
+            if d:
+                existing_dates.add(d)
+    conflicts = existing_dates - {today_str}
+    return (len(conflicts) == 0), conflicts
 
 
 def verify_write(sheet_id, data_rows, start_row, today_str, token, label):
@@ -458,6 +474,11 @@ def init_or_write_row(sheet_id, header_row, data_row, today_str, token, label):
             return False
     else:
         next_row = find_last_data_row(sheet_id, token) + 1
+        safe, conflicts = check_block_boundary(sheet_id, next_row, 1, today_str, token)
+        if not safe:
+            print(f"  ❌ {label}: 追加行{next_row} 存在冲突日期 {conflicts}，中止写入")
+            print(f"      请手动整理表格后再运行")
+            return False
         ok, code, msg = put_row(sheet_id, next_row, data_row, token)
         if ok:
             print(f"  ✅ {label}: 追加 行{next_row}")
@@ -499,6 +520,12 @@ def init_or_write_top(data, header_row, today_str, token):
         else:
             start = find_last_data_row(sid, token) + 1
             mode = "追加"
+            # 边界检查：追加前确认目标 10 行块内没有其他日期的旧数据
+            safe, conflicts = check_block_boundary(sid, start, 10, today_str, token)
+            if not safe:
+                print(f"  ❌ 头部明细: 追加起点行{start} 存在冲突日期 {conflicts}，中止写入")
+                print(f"      请手动整理表格后再运行")
+                return False
 
     for i, row in enumerate(data_rows):
         ok, code, msg = put_row(sid, start + i, row, token)
